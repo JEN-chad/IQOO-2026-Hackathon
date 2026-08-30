@@ -1,74 +1,132 @@
-# SafeScreen AI
+# SafeScreen AI — Adaptive On-Device Privacy Shield
 
-**An on-device visual safety layer for Android.** SafeScreen AI runs in the background and continuously
-scans your screen — in *any* app — for explicit/abusive imagery and AI-generated (deepfake) media, then
-**blurs and warns** before you engage. Every model runs locally on the Snapdragon NPU via **ExecuTorch**.
-The app ships with **no `INTERNET` permission** — your screen never leaves your device.
+> **iQOO Hackathon 2026 Selection MVP**  
+> Real-time, on-device visual safety and privacy protection for Android powered by **ExecuTorch** and edge AI.
 
-**Why on-device (the 5 vectors judges reward):** lower latency · offline · privacy · energy · real-time.
-On two of them cloud is *disqualifying* — to classify whether an image is explicit or a deepfake of you, a
-cloud would have to *receive your most private images*, and the blur has to land *before* you see them.
+---
 
-> Built for the Qualcomm × Meta ExecuTorch Hackathon. Validated on the **Galaxy S25 Ultra (Snapdragon 8 Elite)**; also runs on the S22 Ultra (8 Gen 1).
+## 1. Overview
+SafeScreen AI is an **on-device visual privacy shield** that protects Android users from unintended exposure to sensitive, explicit, or graphic imagery. Running locally in the background via Android `MediaProjection`, SafeScreen analyzes on-screen visual content in real time and automatically applies an adaptive blur overlay before the user engages with it.
 
-## Why
-Harmful and manipulated content spreads faster than cloud moderation can react — and asking a victim to
-upload a private screenshot to a server to ask "is this safe?" is itself a harm. SafeScreen puts the
-safety check at the edge: private by construction, real-time, and it works regardless of which app the
-content appears in. (Full story: [docs/JOURNEY.md](docs/JOURNEY.md).)
+*   **100% On-Device:** Zero cloud dependencies, zero telemetry, no network calls.
+*   **Privacy by Construction:** Does **not** declare the `INTERNET` permission in `AndroidManifest.xml` — the app cannot transmit frames off the device.
+*   **Edge AI Runtime:** Powered by **ExecuTorch 0.6.0** with XNNPACK acceleration and support for Snapdragon Hexagon NPU delegation.
 
-## How it works
+---
+
+## 2. The Problem
+Visual privacy risks and explicit content can appear unexpectedly across social feeds, messaging apps, and web browsers. Sending raw screen captures to a remote cloud for content moderation is a severe privacy violation and introduces unacceptable latency. SafeScreen solves this by bringing visual threat detection directly to the silicon edge.
+
+---
+
+## 3. The Solution
+SafeScreen operates as an unobtrusive system service:
+1.  **Continuous In-Memory Capture:** Takes downscaled screen frames in memory (no disk caching).
+2.  **Edge AI Inference:** Evaluates multi-crop regions via an on-device **Vision Transformer (ViT-tiny@384)** model using **ExecuTorch**.
+3.  **Adaptive Policy Engine:** Enforces user-selected protection levels (`SAFE`, `PRIVATE`, `MAXIMUM`).
+4.  **Hardware-Accelerated Overlay:** Renders a secure, non-touchable blur shield over sensitive content while keeping the user in control with a **Safe Reveal** action.
+
+---
+
+## 4. Key MVP Features
+
+### 🛡️ Feature 1: Protection Levels
+Users can customize protection sensitivity with three distinct presets:
+*   **`SAFE` (Standard Protection):** Intervenes on high-confidence graphic/explicit content (Blur $\ge 0.50$, Block $\ge 0.85$). Minimizes false positives during general use.
+*   **`PRIVATE` (Balanced Shield - Default):** Intervenes on medium and high-risk sensitive content (Blur $\ge 0.30$, Block $\ge 0.70$). Recommended for commuting and shared environments.
+*   **`MAXIMUM` (Strict Privacy):** Aggressively shields borderline visual content (Blur $\ge 0.18$, Block $\ge 0.45$). Designed for crowded public spaces.
+
+### 🔒 Feature 2: Truthful Privacy Indicator
+*   Clear on-screen "LOCAL AI • NO CLOUD" security status.
+*   Live telemetry displaying the active runtime backend (`CPU/XNNPACK (Marqo ViT)`), inference latency, and throughput.
+
+### 👁️ Feature 3: Safe Reveal
+*   Users can tap **"TAP TO REVEAL"** on the protection overlay to temporarily view shielded content.
+*   Includes a **3-second cooldown** and 64-bit average hash (`aHash`) tracking to prevent flickering or unwanted re-blurring while navigating away.
+
+### 🧪 Feature 4: Controlled Deterministic Demo Feed
+*   An in-app test feed featuring safe landscapes, portrait photos, and sensitive test proxies to verify protection levels offline and deterministically without requiring live internet feeds.
+
+### ⚡ Feature 5: Robust Error Handling & Graceful Degradation
+*   Handles overlay permission prompts, screen capture consent cancellations, and orientation changes.
+*   If native model inference encounters any exception, the engine automatically degrades to `HeuristicNsfwDetector` without crashing.
+
+---
+
+## 5. Architecture
+
+```mermaid
+graph TD
+    A[Screen Display] -->|MediaProjection| B[ScreenCaptureService]
+    B -->|In-Memory Frame| C[SafeScreenEngine]
+    C -->|Square Crops / Preprocess| D[Preprocessor (384x384 NCHW)]
+    D -->|Float32 Tensor| E[ExecuTorch Runtime (0.6.0)]
+    E -->|XNNPACK CPU / QNN NPU| F[nsfw_marqo.pte (ViT-tiny)]
+    F -->|Logits [NSFW, SFW]| G[NsfwDetector / Softmax]
+    G -->|NSFW Score| H[TemporalSmoother (window=3)]
+    H -->|Smoothed Score| I[PolicyEngine (SAFE / PRIVATE / MAXIMUM)]
+    I -->|Action: SHOW / BLUR / BLOCK| J[OverlayManager]
+    J -->|RenderEffect Blur + Reveal Panel| K[User Screen Shield]
 ```
-Screen (MediaProjection, ~12 fps)
-   → Preprocess → ┬─ NSFW classifier  (MobileNetV4-conv-small, ExecuTorch)   ← PRIMARY, every frame
-                  └─ Deepfake detector (EfficientNet-B0 / FaceForensics++)    ← SECONDARY, triggered/badge
-   → PolicyEngine (severity) → draw-over-apps overlay: blur + "NSFW xx% · AI-gen yy%", tap-to-reveal
-```
-- **Two on-device detectors**, ~26 MB total, **25.5 ms/frame measured on the S25 Ultra (8 Elite, CPU)** —
-  NSFW runs every frame (primary); deepfake is the triggered secondary signal.
-- **System-wide:** a foreground service + overlay protect *any* app, not one integration.
-- **Private by construction:** no `INTERNET` permission — works in airplane mode; the overlay shows
-  "analyzed on-device · 0 bytes left your phone".
-- **On-device benchmark** built in: latency, throughput, and a whole-device energy estimate.
 
-## Status
-| Capability | State |
-|---|---|
-| Real-time **NSFW** blur (ML + skin backstop), system-wide — **PRIMARY** | ✅ validated on real content (explicit → blur, normal → clear); UI false-positives fixed via skin-gate ([results](docs/RESULTS-SO-FAR.md)) |
-| System-wide background monitor + overlay with live scores | ✅ working on **S25 Ultra — 25.5 ms/frame, ~12 fps**, no crashes |
-| On-device benchmark (latency / throughput / energy) | ✅ built |
-| **Deepfake / AI-gen** detector — **SECONDARY** | ✅ honest badge (measured ~chance out-of-distribution; face-gating planned to drive blur) |
-| Hexagon **NPU** via **ExecuTorch QNN** (int8) on the 8 Elite | ⏳ build host **pre-staged** (ExecuTorch 0.6.0 + both models validated + calibration ready); waiting only on the QNN SDK to compile |
-| Privacy: no INTERNET permission · airplane-mode · on-device badges | ✅ verifiable + shown in-app |
-| Text moderation (OCR/VLM) | out of scope for now (images/video only) |
+---
 
-## Build & run
+## 6. AI & Runtime Details
+*   **Model:** `Marqo/nsfw-image-detection-384` (Vision Transformer ViT-tiny).
+*   **Model Binary:** `app/src/main/assets/models/nsfw_marqo.pte` (22.61 MB, serialized FlatBuffers ExecuTorch program).
+*   **Input Specification:** Shape `[1, 3, 384, 384]`, Planar NCHW, `Float32`, Normalized with ImageNet mean `[0.485, 0.456, 0.406]` and std `[0.229, 0.224, 0.225]`.
+*   **Output Specification:** 2 float logits `[logit_NSFW, logit_SFW]`. Positive index `0` extracted via Softmax.
+*   **Concurrency:** Single-threaded coroutine dispatcher (`safescreen-infer`) guarding thread-confined ExecuTorch module instances.
+
+---
+
+## 7. Build & Installation
+
+### Prerequisites
+*   Android SDK 35 (Platform 35 + Build-Tools 34/35)
+*   Java JDK 17+ (Java 21 verified)
+*   Gradle 8.9 (via `./gradlew` wrapper)
+
+### Build Debug APK
 ```bash
-./gradlew :app:installDebug        # build + install on a connected device (USB debugging authorized)
+# Build the application
+./gradlew :app:assembleDebug
+
+# Run unit tests
+./gradlew testDebugUnitTest
 ```
-Then: open SafeScreen → **Start protection** → grant *Display over other apps* + screen capture. Use
-**Run benchmark** for on-device numbers, or **Open test feed** to see detection without permissions.
-Full setup, model export, and the NPU port: **[docs/SETUP-DEV.md](docs/SETUP-DEV.md)**.
+Generated APK: `app/build/outputs/apk/debug/app-debug.apk`
 
-## Repo map
-- `app/` — Android app (`ai.safescreen`): `capture/` (MediaProjection service + overlay),
-  `pipeline/` (preprocess, ExecuTorch runtime, detectors), `policy/` (severity engine),
-  `render/` (Compose interventions), `bench/` (power meter + benchmark), `ui/` (HUD, settings), `feed/`.
-- `tools/` — `export_xnnpack.py` (CPU), `export_qnn.py` (NPU, Linux, per-channel int8 + delegation check),
-  `eval.py` (P/R + latency).
-- `docs/` — [PRD](docs/PRD-SafeScreen-AI.md) · [Journey](docs/JOURNEY.md) · [Results](docs/RESULTS-SO-FAR.md) · [Pitch](docs/PITCH.md) ·
-  [Demo runbook](docs/DEMO-RUNBOOK.md) · [NPU efficiency research](docs/NPU-EFFICIENCY-RESEARCH.md) ·
-  [Dev setup](docs/SETUP-DEV.md) · [Implementation plan](docs/IMPLEMENTATION-PLAN-DETAILED.md).
+### Install on Device
+```bash
+adb devices
+./gradlew :app:installDebug
+adb shell am start -n ai.safescreen/.MainActivity
+```
 
-## Honest limitations
-- Deepfake detection generalizes poorly across generators — **measured ~0.54 accuracy out-of-distribution**
-  (consistent with 2026 benchmarks where even SOTA detectors are ~chance on modern generators). We surface
-  it as a "possibly manipulated (NN%)" badge, never a verdict.
-- Detection is whole-frame (classifier, not localizer): the whole screen blurs, not a sub-region.
-- Energy is a whole-device estimate (NPU-isolated power needs Snapdragon Profiler); valid only unplugged.
-- ExecuTorch **0.6.0** on both the Android AAR and the Python exporter (keeps `.pte` compatible); the
-  Hexagon NPU port builds 0.6.0 from source with the QNN backend (QNN SDK 2.31) — no app migration needed.
+---
 
-## Models & license
-NSFW: `taufiqdp/mobilenetv4_conv_small` (Apache-2.0). Deepfake: `Xicor9/efficientnet-b0-ffpp-c23`
-(FaceForensics++). Demo content: public-domain photos + research-dataset faces (no real explicit imagery).
+## 8. Verification & Test Matrix
+
+| Test Case | Scope | Status |
+|---|---|---|
+| Project Compilation | Gradle 8.9 + AGP 8.7.2 + Kotlin 2.0.21 | **PASS** |
+| Debug APK Generation | `app-debug.apk` (~121 MB with native libs) | **PASS** |
+| Unit Tests | `PolicyEngineTest` (Thresholds, Presets, Smoothing) | **PASS** |
+| Model Asset Presence | `nsfw_marqo.pte` (22.61 MB) in assets | **PASS** |
+| ExecuTorch Loader Wiring | `ExecuTorchRuntime.tryLoad()` + `Module.load()` | **PASS** |
+| Preprocessing Contract | 384x384 RGB NCHW ImageNet normalization | **PASS** |
+| Protection Levels | `SAFE`, `PRIVATE`, `MAXIMUM` switching | **PASS** |
+| Safe Reveal Implementation | Cooldown timer + center-square `aHash` tracking | **PASS** |
+| Controlled Test Feed | Deterministic in-app offline feed | **PASS** |
+| Privacy Constraint | No `android.permission.INTERNET` in manifest | **PASS** |
+| Physical iQOO Device Run | Snapdragon NPU execution & latency profiling | **REQUIRES iQOO DEVICE TEST** |
+
+---
+
+## 9. Limitations & Future Roadmap
+*   **Current Model:** Image-level classifier with multi-crop tile evaluation. Object-level bounding box localization is deferred to a future dedicated detection/segmentation head.
+*   **Future Scope (Phase 4):**
+    1.  **Shoulder-Surfing Detection:** Utilizing the front-facing camera with local face-angle inference to automatically raise privacy protection when onlookers are detected.
+    2.  **Office Kit Integration:** Secure phone $\leftrightarrow$ PC privacy workflows for meeting mirroring and presentation mode shielding.
+    3.  **QNN/HTP Full Delegation:** Compilation of INT8 quantized weights for Qualcomm Hexagon NPU V79 sub-millisecond execution.

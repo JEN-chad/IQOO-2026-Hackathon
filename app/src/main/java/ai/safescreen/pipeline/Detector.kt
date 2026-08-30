@@ -34,7 +34,7 @@ class ExecuTorchNsfwDetector(
     }
 }
 
-private fun scoreOf(logits: FloatArray, cfg: ModelConfig): Float {
+internal fun scoreOf(logits: FloatArray, cfg: ModelConfig): Float {
     if (cfg.outputIsProbability) {
         var s = 0f
         for (i in cfg.positiveIndices) s += logits[i]
@@ -47,7 +47,36 @@ private fun scoreOf(logits: FloatArray, cfg: ModelConfig): Float {
     for (l in logits) sum += exp(l - maxL)
     var pos = 0f
     for (i in cfg.positiveIndices) pos += exp(logits[i] - maxL)
-    return pos / sum
+    val score = (pos / sum).coerceIn(0f, 1f)
+
+    if (logits.size == 5) {
+        val p0 = exp(logits[0] - maxL) / sum
+        val p1 = exp(logits[1] - maxL) / sum
+        val p2 = exp(logits[2] - maxL) / sum
+        val p3 = exp(logits[3] - maxL) / sum
+        val p4 = exp(logits[4] - maxL) / sum
+        runCatching {
+            Log.i(
+                "SAFESCREEN_MODEL_DEBUG",
+                "raw_0=${"%.3f".format(logits[0])} raw_1=${"%.3f".format(logits[1])} raw_2=${"%.3f".format(logits[2])} raw_3=${"%.3f".format(logits[3])} raw_4=${"%.3f".format(logits[4])} " +
+                    "prob_0=${"%.3f".format(p0)} prob_1=${"%.3f".format(p1)} prob_2=${"%.3f".format(p2)} prob_3=${"%.3f".format(p3)} prob_4=${"%.3f".format(p4)} " +
+                    "nsfw_score=${"%.3f".format(score)} classification=${if (score >= 0.15f) "SUSPICIOUS" else "SAFE"} threshold=0.150"
+            )
+        }
+    } else if (logits.size == 2) {
+        val p0 = exp(logits[0] - maxL) / sum
+        val p1 = exp(logits[1] - maxL) / sum
+        runCatching {
+            Log.i(
+                "SAFESCREEN_MODEL_DEBUG",
+                "MARQO raw_0=${"%.3f".format(logits[0])} raw_1=${"%.3f".format(logits[1])} " +
+                    "prob_0(NSFW)=${"%.3f".format(p0)} prob_1(SFW)=${"%.3f".format(p1)} " +
+                    "nsfw_score=${"%.3f".format(score)}"
+            )
+        }
+    }
+
+    return score
 }
 
 // ---------- Model-free heuristic (so the pipeline runs and demos before a .pte exists) ----------
@@ -88,41 +117,53 @@ fun skinRatio(bitmap: Bitmap): Float {
     return if (total == 0) 0f else skin.toFloat() / total
 }
 
-// ---------- Factory: prefer models, fall back to heuristic ----------
+// ---------- Factory: prefer tiered models, fall back to heuristic ----------
 
 object DetectorFactory {
     private const val TAG = "DetectorFactory"
 
     data class Detectors(
-        val nsfw: NsfwDetector,
+        val fastNsfw: NsfwDetector,
+        val validatorNsfw: NsfwDetector?,
         val usingModels: Boolean,
         val backend: String,
-        /** True when the NSFW model is the calibrated Marqo classifier (trust its score directly;
-         *  no skin backstop / UI-FP cap, lower blur threshold). False for the weak MobileNetV4. */
-        val nsfwCalibrated: Boolean = false,
+        val nsfwCalibrated: Boolean = true,
     )
 
     fun create(context: Context): Detectors {
-        // NSFW model preference: Marqo on QNN/NPU  >  Marqo on CPU  >  MobileNetV4 on CPU.
-        val nsfwRt: ModelRuntime?
-        val nsfwCfg: ModelConfig
-        val marqoQnnRt = ExecuTorchRuntime.tryLoad(context, ModelConfig.NSFW_MARQO_QNN.assetPath, "QNN/HTP", qnn = true)
-        if (marqoQnnRt != null) {
-            nsfwRt = marqoQnnRt; nsfwCfg = ModelConfig.NSFW_MARQO_QNN
+        val mobilenetRt = ExecuTorchRuntime.tryLoad(context, ModelConfig.NSFW_MOBILENET.assetPath)
+        val marqoRt = ExecuTorchRuntime.tryLoad(context, ModelConfig.NSFW_MARQO.assetPath)
+
+        val fastDetector: NsfwDetector = if (mobilenetRt != null) {
+            ExecuTorchNsfwDetector(mobilenetRt, ModelConfig.NSFW_MOBILENET)
+        } else if (marqoRt != null) {
+            ExecuTorchNsfwDetector(marqoRt, ModelConfig.NSFW_MARQO)
         } else {
-            val marqoRt = ExecuTorchRuntime.tryLoad(context, ModelConfig.NSFW_MARQO.assetPath)
-            if (marqoRt != null) {
-                nsfwRt = marqoRt; nsfwCfg = ModelConfig.NSFW_MARQO
-            } else {
-                nsfwRt = ExecuTorchRuntime.tryLoad(context, ModelConfig.NSFW.assetPath); nsfwCfg = ModelConfig.NSFW
-            }
+            HeuristicNsfwDetector()
         }
-        val calibrated = nsfwCfg === ModelConfig.NSFW_MARQO_QNN || nsfwCfg === ModelConfig.NSFW_MARQO
-        val nsfw: NsfwDetector =
-            if (nsfwRt != null) ExecuTorchNsfwDetector(nsfwRt, nsfwCfg) else HeuristicNsfwDetector()
-        val usingModels = nsfwRt != null
-        val backend = nsfwRt?.backend ?: "HEURISTIC"
-        Log.i(TAG, "Detectors ready (models=$usingModels, backend=$backend, nsfwModel=${nsfwCfg.assetPath}, calibrated=$calibrated)")
-        return Detectors(nsfw, usingModels, backend, nsfwCalibrated = calibrated)
+
+        val validatorDetector: NsfwDetector? = if (mobilenetRt != null && marqoRt != null) {
+            ExecuTorchNsfwDetector(marqoRt, ModelConfig.NSFW_MARQO)
+        } else null
+
+        val usingModels = mobilenetRt != null || marqoRt != null
+        val backend = if (mobilenetRt != null && marqoRt != null) {
+            "MobileNetV4+Marqo(Tiered)"
+        } else if (mobilenetRt != null) {
+            "MobileNetV4"
+        } else if (marqoRt != null) {
+            "Marqo"
+        } else {
+            "HEURISTIC"
+        }
+
+        Log.i(TAG, "Detectors ready (models=$usingModels, backend=$backend, tiered=${validatorDetector != null})")
+        return Detectors(
+            fastNsfw = fastDetector,
+            validatorNsfw = validatorDetector,
+            usingModels = usingModels,
+            backend = backend,
+            nsfwCalibrated = true
+        )
     }
 }

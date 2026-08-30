@@ -75,5 +75,6 @@ dependencies {
     implementation(libs.soloader)
     implementation(libs.fbjni)
 
+    testImplementation(kotlin("test"))
     debugImplementation(libs.androidx.ui.tooling)
 }

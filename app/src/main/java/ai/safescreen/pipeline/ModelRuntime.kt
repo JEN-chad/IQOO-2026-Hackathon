@@ -22,12 +22,38 @@ class ExecuTorchRuntime private constructor(
     override val backend: String,
 ) : ModelRuntime {
 
+    private var inferenceCount = 0
+    private val warmTimesMs = mutableListOf<Double>()
+
     // The native ExecuTorch Module is NOT thread-safe (concurrent forward() races in the lazy
     // method-loader and corrupts the heap). Serialize all calls through this runtime.
     @Synchronized
     override fun run(input: FloatArray, shape: LongArray): FloatArray {
         val tensor = org.pytorch.executorch.Tensor.fromBlob(input, shape)
-        val outputs = module.forward(org.pytorch.executorch.EValue.from(tensor))
+        val eValue = org.pytorch.executorch.EValue.from(tensor)
+
+        val t0 = android.os.SystemClock.elapsedRealtimeNanos()
+        val outputs = module.forward(eValue)
+        val t1 = android.os.SystemClock.elapsedRealtimeNanos()
+
+        val elapsedMs = (t1 - t0) / 1_000_000.0
+        inferenceCount++
+
+        if (inferenceCount == 1) {
+            android.util.Log.i("SAFESCREEN_BENCHMARK", "first_inference_ms=${"%.2f".format(elapsedMs)}")
+        } else {
+            warmTimesMs.add(elapsedMs)
+            android.util.Log.i("SAFESCREEN_BENCHMARK", "warm_inference_${inferenceCount}_ms=${"%.2f".format(elapsedMs)}")
+            if (inferenceCount == 5) {
+                val avg = warmTimesMs.average()
+                val min = warmTimesMs.minOrNull() ?: 0.0
+                val max = warmTimesMs.maxOrNull() ?: 0.0
+                android.util.Log.i("SAFESCREEN_BENCHMARK", "warm_average_ms=${"%.2f".format(avg)}")
+                android.util.Log.i("SAFESCREEN_BENCHMARK", "warm_min_ms=${"%.2f".format(min)}")
+                android.util.Log.i("SAFESCREEN_BENCHMARK", "warm_max_ms=${"%.2f".format(max)}")
+            }
+        }
+
         return outputs[0].toTensor().dataAsFloatArray
     }
 

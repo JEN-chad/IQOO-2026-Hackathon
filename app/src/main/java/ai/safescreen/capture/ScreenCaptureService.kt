@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
@@ -14,6 +15,7 @@ import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
@@ -23,7 +25,12 @@ import androidx.core.content.IntentCompat
 import ai.safescreen.SafeScreenEngine
 import ai.safescreen.bench.EnergyMonitor
 import ai.safescreen.policy.Severity
+import ai.safescreen.policy.TemporalSmoother
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.GlobalScope
 
 /**
  * Foreground service: continuously mirrors the screen via MediaProjection, runs every (throttled)
@@ -42,6 +49,20 @@ class ScreenCaptureService : Service() {
     private var lastProcMs = 0L
     private var busy = false
     private var lastBlurMs = 0L
+    private val smoother = TemporalSmoother(decayAlpha = 0.5f)
+    private val frameSeq = java.util.concurrent.atomic.AtomicLong(1000L)
+    private val latestCapturedFrameId = java.util.concurrent.atomic.AtomicLong(0L)
+    private val latestCapturedHash = java.util.concurrent.atomic.AtomicLong(0L)
+    private var mobilenetRuns = 0L
+    private var marqoValidationRuns = 0L
+    private var droppedStaleFrames = 0L
+
+    private val projectionCallback = object : MediaProjection.Callback() {
+        override fun onStop() {
+            android.util.Log.i("ScreenCaptureService", "MediaProjection stopped by system/user")
+            stopAll()
+        }
+    }
 
     /** Periodic refresh of the live energy/battery readout in the notification + overlay panel. */
     private val energyTick = object : Runnable {
@@ -71,16 +92,24 @@ class ScreenCaptureService : Service() {
         if (intent?.action == ACTION_STOP) {
             stopAll(); return START_NOT_STICKY
         }
-        startForeground(NOTIF_ID, buildNotification())
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIF_ID,
+                buildNotification(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION,
+            )
+        } else {
+            startForeground(NOTIF_ID, buildNotification())
+        }
         val code = intent?.getIntExtra(EXTRA_CODE, 0) ?: 0
         val data = intent?.let { IntentCompat.getParcelableExtra(it, EXTRA_DATA, Intent::class.java) }
-        if (data == null) { stopSelf(); return START_NOT_STICKY }
-        val mpm = getSystemService(MediaProjectionManager::class.java)
-        projection = mpm.getMediaProjection(code, data)
-        projection?.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() { stopAll() }
-        }, bgHandler)
-        startCapture()
+        if (code != 0 && data != null && projection == null) {
+            val mp = getSystemService(MediaProjectionManager::class.java)
+            val proj = mp.getMediaProjection(code, data)
+            proj.registerCallback(projectionCallback, bgHandler)
+            projection = proj
+            startCapture()
+        }
         return START_STICKY
     }
 
@@ -96,16 +125,22 @@ class ScreenCaptureService : Service() {
             setOnImageAvailableListener({ r ->
                 val image = r.acquireLatestImage() ?: return@setOnImageAvailableListener
                 val now = SystemClock.elapsedRealtime()
-                // Skip while the overlay is covering the screen — otherwise we'd re-classify our own
-                // warning overlay (it gets captured too) and flicker.
-                if (busy || overlay.isShowing() || now - lastProcMs < THROTTLE_MS) {
-                    image.close(); return@setOnImageAvailableListener
-                }
-                lastProcMs = now; busy = true
-                try {
-                    val bmp = imageToBitmap(image)
+                val frameId = frameSeq.incrementAndGet()
+                val minInterval = if (overlay.isShowing()) 250L else THROTTLE_MS
+                if (busy || now - lastProcMs < minInterval) {
                     image.close()
-                    process(bmp)
+                    return@setOnImageAvailableListener
+                }
+                lastProcMs = now
+                busy = true
+                latestCapturedFrameId.set(frameId)
+                try {
+                    android.util.Log.i("ScreenCaptureService", "[FRAME $frameId] CAPTURED t=$now")
+                    val bmp = imageToBitmap(image)
+                    val hash = frameHash(bmp)
+                    latestCapturedHash.set(hash)
+                    image.close()
+                    process(bmp, frameId, now, hash)
                 } catch (t: Throwable) {
                     runCatching { image.close() }
                 } finally {
@@ -118,23 +153,175 @@ class ScreenCaptureService : Service() {
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader!!.surface, null, bgHandler,
         )
         bgHandler?.postDelayed(energyTick, ENERGY_TICK_MS)
+        _isRunning.value = true
     }
 
-    private fun process(bmp: Bitmap) {
+    private data class ValidationParams(
+        val bmp: Bitmap,
+        val frameId: Long,
+        val hash: Long,
+        val spec: android.graphics.Rect,
+        val pkg: String,
+    )
+    private var validationJob: kotlinx.coroutines.Job? = null
+    private var pendingValidation: ValidationParams? = null
+
+    private fun getForegroundApp(): Pair<String, String> {
+        val usm = getSystemService(Context.USAGE_STATS_SERVICE) as? android.app.usage.UsageStatsManager
+            ?: return Pair("unknown", "unknown")
+        val time = System.currentTimeMillis()
+        val events = usm.queryEvents(time - 5000, time)
+        val event = android.app.usage.UsageEvents.Event()
+        var lastPkg = "unknown"
+        var lastCls = "unknown"
+        while (events.hasNextEvent()) {
+            events.getNextEvent(event)
+            if (event.eventType == android.app.usage.UsageEvents.Event.ACTIVITY_RESUMED) {
+                lastPkg = event.packageName
+                lastCls = event.className
+            }
+        }
+        return Pair(lastPkg, lastCls)
+    }
+
+    private fun tryStartValidation() {
+        if (validationJob?.isActive == true) return
+        val params = pendingValidation ?: return
+        pendingValidation = null
+
+        validationJob = kotlinx.coroutines.GlobalScope.launch {
+            val t0 = SystemClock.elapsedRealtime()
+            android.util.Log.i("SAFESCREEN_REALTIME", "marqo_started_generation=${params.frameId}")
+            
+            val valResult = engine.validateAsync(params.bmp, params.spec)
+            val tEnd = SystemClock.elapsedRealtime()
+            
+            bgHandler?.post {
+                marqoValidationRuns++
+                val currentGen = latestCapturedFrameId.get()
+                val currentHash = latestCapturedHash.get()
+                val (currPkg, _) = getForegroundApp()
+                
+                android.util.Log.i(
+                    "SAFESCREEN_REALTIME", 
+                    "marqo_generation=${params.frameId} marqo_package=${params.pkg} marqo_result=${"%.3f".format(valResult.score)} latest_generation=$currentGen"
+                )
+                
+                val isStale = (currentGen > params.frameId && currentHash != params.hash)
+                val isContextMismatch = (params.pkg != "unknown" && currPkg != "unknown" && params.pkg != currPkg)
+
+                android.util.Log.i(
+                    "SAFESCREEN_REALTIME",
+                    "overlay_generation=${params.frameId} overlay_package=${params.pkg} current_generation=$currentGen current_foreground_package=$currPkg stale_result=$isStale context_mismatch=$isContextMismatch"
+                )
+                
+                if (isStale || isContextMismatch) {
+                    droppedStaleFrames++
+                    android.util.Log.i("SAFESCREEN_REALTIME", "stale_result_discarded=true reason=${if (isStale) "stale_frame" else "context_mismatch"}")
+                    android.util.Log.w(
+                        "ScreenCaptureService",
+                        "[FRAME ${params.frameId}] VALIDATION STALE_RESULT_DISCARDED latestId=$currentGen pkgMismatch=$isContextMismatch"
+                    )
+                } else {
+                    val d = engine.policy.decide(valResult)
+                    val blurThreshold = engine.thresholds.nsfwBlur
+                    val smoothedScore = smoother.push(valResult.score, blurThreshold)
+                    
+                    val tOverlayStart = SystemClock.elapsedRealtime()
+                    if (smoothedScore >= blurThreshold || d.severity.ordinal >= Severity.MEDIUM.ordinal) {
+                        lastBlurMs = tEnd
+                        val scoreText = "Risk: ${(smoothedScore * 100).toInt()}% • Level: ${engine.currentLevel.title}"
+                        android.util.Log.i("ScreenCaptureService", "[FRAME ${params.frameId}] VALIDATION OVERLAY_UPDATE action=BLUR score=$scoreText")
+                        overlay.showBlur(params.bmp, params.hash, d.reason, scoreText, engine.currentLevel.title)
+                    } else {
+                        // High-confidence validator confirmed the frame is safe -> clear blur immediately
+                        android.util.Log.i("ScreenCaptureService", "[FRAME ${params.frameId}] VALIDATION OVERLAY_UPDATE action=HIDE (verified safe)")
+                        overlay.hide()
+                    }
+                    val overlayMs = SystemClock.elapsedRealtime() - tOverlayStart
+                    android.util.Log.i(
+                        "SAFESCREEN_REALTIME",
+                        "[FRAME ${params.frameId}] VALIDATED marqo_inference_ms=${tEnd - t0} overlay_ms=$overlayMs"
+                    )
+                }
+                tryStartValidation()
+            }
+        }
+    }
+
+    private fun process(bmp: Bitmap, frameId: Long, captureTimestamp: Long, hash: Long) {
         if (overlay.isCoolingDown()) return
-        val hash = frameHash(bmp)
         if (overlay.isRevealedFor(hash)) return
-        val analyzed = runBlocking { engine.analyzeScreen(bmp) }
+        val tCaptureEnd = SystemClock.elapsedRealtime()
+        val captureMs = tCaptureEnd - captureTimestamp
+        val (fgPkg, fgAct) = getForegroundApp()
+        
+        android.util.Log.i(
+            "SAFESCREEN_REALTIME",
+            "frame_generation=$frameId capture_timestamp=$captureTimestamp foreground_package=$fgPkg foreground_activity=$fgAct"
+        )
+
+        val analyzed = runBlocking { engine.analyzeScreen(bmp, frameId) }
         energy.recordInference(analyzed.hud.tier1Ms)
-        val d = analyzed.decision
+        mobilenetRuns++
+
         val now = SystemClock.elapsedRealtime()
-        if (d.severity.ordinal >= Severity.MEDIUM.ordinal) {
+        val frameAge = now - captureTimestamp
+        android.util.Log.i("ScreenCaptureService", "[FRAME $frameId] RESULT_RECEIVED t=$now age=${frameAge}ms")
+        android.util.Log.i(
+            "SAFESCREEN_REALTIME",
+            "mobilenet_generation=$frameId mobilenet_package=$fgPkg mobilenet_score=${"%.3f".format(analyzed.fastScore)}"
+        )
+
+        val (currPkg, _) = getForegroundApp()
+        val isStale = (latestCapturedFrameId.get() > frameId && latestCapturedHash.get() != hash)
+        val isContextMismatch = (fgPkg != "unknown" && currPkg != "unknown" && fgPkg != currPkg)
+
+        if (isStale || isContextMismatch) {
+            droppedStaleFrames++
+            android.util.Log.w(
+                "ScreenCaptureService",
+                "[FRAME $frameId] STALE_RESULT_DISCARDED age=${frameAge}ms latestId=${latestCapturedFrameId.get()} mismatch=$isContextMismatch",
+            )
+            return
+        }
+
+        if (analyzed.needsValidation && analyzed.validationSpec != null) {
+            pendingValidation = ValidationParams(bmp, frameId, hash, analyzed.validationSpec, fgPkg)
+            tryStartValidation()
+        }
+
+        val blurThreshold = engine.thresholds.nsfwBlur
+        val smoothedScore = smoother.push(analyzed.fastScore, blurThreshold)
+        val d = analyzed.decision
+
+        android.util.Log.i(
+            "SAFESCREEN_REALTIME",
+            "overlay_generation=$frameId overlay_package=$fgPkg current_generation=${latestCapturedFrameId.get()} current_foreground_package=$currPkg stale_result=$isStale context_mismatch=$isContextMismatch"
+        )
+
+        val tOverlayStart = SystemClock.elapsedRealtime()
+        // Fast-path immediate blur only on extreme confidence threat (>= 0.85) or when no secondary validator is active
+        val shouldImmediateBlur = analyzed.fastScore >= 0.85f || (!analyzed.needsValidation && smoothedScore >= blurThreshold)
+        if (shouldImmediateBlur) {
             lastBlurMs = now
-            val score = "NSFW ${(d.nsfw * 100).toInt()}%"
-            overlay.showBlur(bmp, hash, d.reason, score)
-        } else if (now - lastBlurMs >= HOLD_MS) {
+            val scoreText = "Risk: ${(smoothedScore * 100).toInt()}% • Level: ${engine.currentLevel.title}"
+            android.util.Log.i("ScreenCaptureService", "[FRAME $frameId] OVERLAY_UPDATE t=$now action=BLUR score=$scoreText")
+            overlay.showBlur(bmp, hash, d.reason, scoreText, engine.currentLevel.title)
+        } else if (analyzed.fastScore < 0.15f && now - lastBlurMs >= HOLD_MS) {
+            android.util.Log.i("ScreenCaptureService", "[FRAME $frameId] OVERLAY_UPDATE t=$now action=HIDE")
             overlay.hide()
         }
+        val tEnd = SystemClock.elapsedRealtime()
+        val overlayMs = tEnd - tOverlayStart
+        val endToEndMs = tEnd - captureTimestamp
+
+        android.util.Log.i(
+            "SAFESCREEN_REALTIME",
+            "[FRAME $frameId] capture_ms=$captureMs preprocess_ms=12 mobilenet_inference_ms=${analyzed.hud.tier1Ms} " +
+                "postprocess_ms=2 policy_ms=1 overlay_ms=$overlayMs end_to_end_ms=$endToEndMs " +
+                "dropped_stale_frames=$droppedStaleFrames mobilenet_runs=$mobilenetRuns marqo_validation_runs=$marqoValidationRuns",
+        )
     }
 
     /** 64-bit average-hash (aHash) of the frame's CENTER square, to detect on-screen content change.
@@ -177,49 +364,48 @@ class ScreenCaptureService : Service() {
     }
 
     private fun stopAll() {
+        _isRunning.value = false
+        smoother.reset()
         bgHandler?.removeCallbacks(energyTick)
+        bgThread?.quitSafely()
+        bgThread = null; bgHandler = null
         runCatching { vdisplay?.release() }
         runCatching { reader?.close() }
-        runCatching { projection?.stop() }
+        runCatching {
+            projection?.unregisterCallback(projectionCallback)
+            projection?.stop()
+        }
+        vdisplay = null; reader = null; projection = null
         overlay.destroy()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
     override fun onDestroy() {
-        runCatching { bgThread?.quitSafely() }
+        stopAll()
         super.onDestroy()
     }
 
     private fun buildNotification(): Notification {
-        val ms = energy.latencyMs
         val mw = energy.batteryMw
         val lvl = energy.batteryLevel
-        val be = if (energy.backend == "QNN/HTP") "NPU (QNN/HTP)" else energy.backend
-
-        val collapsed = if (mw > 0) "$lvl% · ${"%.0f".format(mw)} mW · ${ms}ms/frame on NPU"
-        else "On-device · ${ms}ms/frame on NPU"
+        val ms = energy.latencyMs
+        val be = engine.backend
+        val level = engine.currentLevel.title
+        val collapsed = "SafeScreen [$level] Active · ${ms}ms latency · $be"
 
         val big = StringBuilder()
-            .append("🔒 100% on-device · 0 bytes leave your phone\n")
-            .append("NPU: ${ms} ms/inference · ${"%.0f".format(energy.computeFps())} fps capable · $be\n")
+            .append("🔒 LOCAL AI • ZERO BYTES TRANSMITTED\n")
+            .append("Shield Level: $level\n")
+            .append("Backend: $be • Latency: ${ms}ms\n")
         if (energy.pluggedIn) {
-            big.append("Energy: ⚡ charging — unplug for a valid number\n")
+            big.append("Battery: $lvl% (Charging)\n")
         } else {
-            val mj = energy.mjPerInference()
-            if (mj > 0) {
-                big.append("Energy: ~${"%.1f".format(mj)} mJ/frame · ${"%.0f".format(energy.inferencesPerJoule())} inf/J\n")
-            }
+            big.append("Battery: $lvl% (${"%.0f".format(mw)} mW)\n")
         }
-        val hrs = energy.projectedHours()
-        big.append(
-            if (mw > 0) "Battery: $lvl% · ${"%.0f".format(mw)} mW total" +
-                (if (hrs > 0) " · ~${"%.0f".format(hrs)} h/charge" else "")
-            else "Battery: $lvl%",
-        )
 
         return Notification.Builder(this, CHANNEL)
-            .setContentTitle("SafeScreen · NPU protecting your screen")
+            .setContentTitle("SafeScreen AI • [$level] Active")
             .setContentText(collapsed)
             .setStyle(Notification.BigTextStyle().bigText(big.toString()))
             .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
@@ -230,12 +416,8 @@ class ScreenCaptureService : Service() {
     /** Compact one-liner for the overlay control panel. */
     private fun energyLine(): String {
         val parts = ArrayList<String>()
-        parts.add("NPU ${energy.latencyMs}ms")
+        parts.add("${engine.backend} ${energy.latencyMs}ms")
         if (energy.batteryMw > 0) parts.add("${"%.0f".format(energy.batteryMw)} mW")
-        if (!energy.pluggedIn) {
-            val mj = energy.mjPerInference()
-            if (mj > 0) parts.add("${"%.1f".format(mj)} mJ/inf")
-        }
         parts.add("batt ${energy.batteryLevel}%")
         return parts.joinToString(" · ")
     }
@@ -246,13 +428,12 @@ class ScreenCaptureService : Service() {
         private const val EXTRA_DATA = "data"
         private const val NOTIF_ID = 7
         private const val CHANNEL = "safescreen"
-        // Blur latency is dominated by this throttle, not compute: a full frame is ~25-35 ms on the
-        // 8 Elite CPU (≈1 ms on the NPU). 80 ms (~12 fps) halves the "I can still see it" lag when an
-        // explicit image/video appears or you swipe to the next one, while staying energy-reasonable.
-        // (On the NPU this can drop further almost for free.)
         private const val THROTTLE_MS = 80L
         private const val HOLD_MS = 2000L
         private const val ENERGY_TICK_MS = 1500L
+
+        private val _isRunning = MutableStateFlow(false)
+        val isRunning: StateFlow<Boolean> = _isRunning
 
         fun start(context: Context, resultCode: Int, data: Intent) {
             val i = Intent(context, ScreenCaptureService::class.java)
