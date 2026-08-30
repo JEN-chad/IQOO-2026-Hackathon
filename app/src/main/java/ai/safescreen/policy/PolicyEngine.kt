@@ -22,13 +22,39 @@ class Thresholds(
     var mlOnlyBlur: Float = 0.85f, // ML alone (no skin) must be this confident to act — guards UI false-positives
 )
 
-class PolicyEngine(val thresholds: Thresholds = Thresholds()) {
+class PolicyEngine(
+    val thresholds: Thresholds = Thresholds(),
+    initialLevel: ProtectionLevel = ProtectionLevel.PRIVATE,
+) {
+    var currentLevel: ProtectionLevel = initialLevel
+        private set
+
+    init {
+        currentLevel.applyTo(thresholds)
+    }
+
+    fun setLevel(level: ProtectionLevel) {
+        currentLevel = level
+        level.applyTo(thresholds)
+    }
+
     fun decide(nsfw: NsfwResult): Decision {
         val n = nsfw.score
         return when {
-            n >= thresholds.nsfwBlock -> Decision(Severity.HIGH, Action.BLOCK, "Explicit content blocked", n)
-            n >= thresholds.nsfwBlur -> Decision(Severity.MEDIUM, Action.BLUR_REVEAL, "Possibly explicit — blurred", n)
+            n >= thresholds.nsfwBlock -> Decision(
+                Severity.HIGH,
+                Action.BLOCK,
+                "[$currentLevel] Explicit content blocked",
+                n,
+            )
+            n >= thresholds.nsfwBlur -> Decision(
+                Severity.MEDIUM,
+                Action.BLUR_REVEAL,
+                "[$currentLevel] Sensitive content shielded",
+                n,
+            )
             else -> Decision(Severity.NONE, Action.SHOW, "No risk detected", n)
         }
     }
 }
+

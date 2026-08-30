@@ -53,7 +53,13 @@ class OverlayManager(private val context: Context) {
         }
     }
 
-    fun showBlur(frame: Bitmap, hash: Long, reason: String, score: String) {
+    fun showBlur(
+        frame: Bitmap,
+        hash: Long,
+        reason: String,
+        score: String,
+        level: String = "PRIVATE",
+    ) {
         if (isCoolingDown()) return
         showing = true
         shownHash = hash
@@ -64,6 +70,7 @@ class OverlayManager(private val context: Context) {
                 setRenderEffect(RenderEffect.createBlurEffect(80f, 80f, Shader.TileMode.CLAMP))
                 visibility = View.VISIBLE
             }
+            titleView?.text = "🛡️ Protected by SafeScreen [$level]"
             subtitle?.text = reason
             scoreView?.text = score
             ctrlPanel?.visibility = View.VISIBLE
@@ -89,7 +96,7 @@ class OverlayManager(private val context: Context) {
         revealedHash = null
         blurView?.let { runCatching { wm.removeView(it) } }
         ctrlPanel?.let { runCatching { wm.removeView(it) } }
-        blurView = null; ctrlPanel = null; subtitle = null; scoreView = null; energyView = null
+        blurView = null; ctrlPanel = null; subtitle = null; scoreView = null; energyView = null; titleView = null
     }
 
     private fun reveal() {
@@ -100,10 +107,12 @@ class OverlayManager(private val context: Context) {
         ctrlPanel?.visibility = View.GONE
     }
 
+    private var titleView: TextView? = null
+
     private fun ensureViews() {
         if (blurView != null) return
 
-        // --- Full-screen blur: FLAG_NOT_TOUCHABLE so swipes/back pass through to the app ---
+        // --- Full-screen blur: FLAG_NOT_TOUCHABLE so swipes/back pass through to the app below ---
         val iv = ImageView(context).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
         }
@@ -118,23 +127,24 @@ class OverlayManager(private val context: Context) {
         runCatching { wm.addView(iv, blurLp) }
         blurView = iv
 
-        // --- Centered control panel: touchable, only covers the info + button area ---
+        // --- Centered control panel: touchable, covers the info + reveal button area ---
         val col = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            setBackgroundColor(0xDD000000.toInt())
+            setBackgroundColor(0xEE0B0E14.toInt())
             setPadding(72, 56, 72, 56)
         }
         val title = TextView(context).apply {
-            text = "⚠️  Protected by SafeScreen"
-            setTextColor(Color.WHITE); textSize = 22f; gravity = Gravity.CENTER
+            text = "🛡️ Protected by SafeScreen"
+            setTextColor(Color.WHITE); textSize = 20f; gravity = Gravity.CENTER
+            typeface = Typeface.DEFAULT_BOLD
         }
         val sub = TextView(context).apply {
-            setTextColor(0xFFD7DEE8.toInt()); textSize = 15f; gravity = Gravity.CENTER
+            setTextColor(0xFFD7DEE8.toInt()); textSize = 14f; gravity = Gravity.CENTER
             setPadding(0, 16, 0, 12)
         }
         val scores = TextView(context).apply {
-            setTextColor(0xFF8FE3A0.toInt()); textSize = 16f; gravity = Gravity.CENTER
+            setTextColor(0xFF8FE3A0.toInt()); textSize = 15f; gravity = Gravity.CENTER
             typeface = Typeface.MONOSPACE
             setPadding(0, 0, 0, 10)
         }
@@ -142,21 +152,24 @@ class OverlayManager(private val context: Context) {
             text = energyText
             setTextColor(0xFFB9C4D0.toInt()); textSize = 12f; gravity = Gravity.CENTER
             typeface = Typeface.MONOSPACE
-            setPadding(0, 0, 0, 24)
+            setPadding(0, 0, 0, 20)
         }
         val btn = Button(context).apply {
             text = "TAP TO REVEAL"
+            setTextColor(Color.WHITE)
+            setBackgroundColor(0xFF1E293B.toInt())
             setOnClickListener { reveal() }
         }
         val privacy = TextView(context).apply {
-            text = "🔒 Analyzed on-device · 0 bytes left your phone"
-            setTextColor(0xFF8FE3A0.toInt()); textSize = 12f; gravity = Gravity.CENTER
-            setPadding(0, 28, 0, 0)
+            text = "🔒 LOCAL AI • ZERO BYTES LEAVE PHONE"
+            setTextColor(0xFF8FE3A0.toInt()); textSize = 11f; gravity = Gravity.CENTER
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, 24, 0, 0)
         }
         val hint = TextView(context).apply {
-            text = "Swipe or use back gesture to navigate"
+            text = "Swipe or use back gesture to continue navigation"
             setTextColor(0x99FFFFFF.toInt()); textSize = 11f; gravity = Gravity.CENTER
-            setPadding(0, 12, 0, 0)
+            setPadding(0, 10, 0, 0)
         }
         col.addView(title); col.addView(sub); col.addView(scores); col.addView(nrg)
         col.addView(btn); col.addView(privacy); col.addView(hint)
@@ -171,7 +184,7 @@ class OverlayManager(private val context: Context) {
             gravity = Gravity.CENTER
         }
         runCatching { wm.addView(col, ctrlLp) }
-        ctrlPanel = col; subtitle = sub; scoreView = scores; energyView = nrg
+        ctrlPanel = col; titleView = title; subtitle = sub; scoreView = scores; energyView = nrg
     }
 
     private companion object {
@@ -180,3 +193,4 @@ class OverlayManager(private val context: Context) {
         const val COOLDOWN_MS = 3000L
     }
 }
+
