@@ -1,0 +1,33 @@
+*.iml
+.gradle/
+/local.properties
+.idea/
+.DS_Store
+/build/
+/app/build/
+/captures
+.externalNativeBuild
+.cxx
+*.apk
+
+# Python tooling
+__pycache__/
+*.pyc
+tools/.venv/
+tools/models_src/
+
+# Model binaries & data (large — distribute out-of-band, not in git)
+*.pte
+/datasets/
+
+# Kotlin build cache
+.kotlin/
+
+# Local session memory / scratch history
+.remember/
+
+# Local backups & prebuilt artifacts (out-of-band, not source)
+/backup-cpu-xnnpack-known-good/
+
+# Logs
+*.log

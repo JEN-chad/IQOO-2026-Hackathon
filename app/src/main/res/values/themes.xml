@@ -1,0 +1,7 @@
+<resources>
+    <!-- Manifest/launch theme only; the live UI is drawn by Jetpack Compose (Material 3). -->
+    <style name="Theme.SafeScreenAI" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#0B0E14</item>
+        <item name="android:windowBackground">#0B0E14</item>
+    </style>
+</resources>
