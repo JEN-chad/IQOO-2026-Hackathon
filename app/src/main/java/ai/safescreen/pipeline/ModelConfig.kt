@@ -18,15 +18,17 @@ class ModelConfig(
         private val IMAGENET_STD = floatArrayOf(0.229f, 0.224f, 0.225f)
 
         // taufiqdp/mobilenetv4_conv_small NSFW (5 classes: drawings,hentai,neutral,porn,sexy).
-        // NSFW = hentai+porn+sexy = indices 1,3,4. Conv-net @224 -> fast + HTP-friendly.
-        val NSFW = ModelConfig(
-            "models/nsfw.pte", 224, IMAGENET_MEAN, IMAGENET_STD,
+        // NSFW = hentai(1) + porn(3) + sexy(4) = indices 1,3,4. Fast continuous watchdog @224 (~75ms).
+        val NSFW_MOBILENET = ModelConfig(
+            "models/nsfw_mobilenetv4.pte", 224, IMAGENET_MEAN, IMAGENET_STD,
             positiveIndices = intArrayOf(1, 3, 4),
         )
 
+        // Legacy alias
+        val NSFW = NSFW_MOBILENET
+
         // Marqo/nsfw-image-detection-384 (ViT-tiny @384, 2 classes). class 0 = NSFW, class 1 = SFW
-        // (verified: benign imgs score class0≈0.06). Higher-accuracy candidate (98.56%); ViT so HTP/NPU
-        // delegation is unproven (CPU/XNNPACK works). Used in preference to NSFW if the asset is bundled.
+        // Secondary high-confidence validator (~1720ms on CPU).
         val NSFW_MARQO = ModelConfig(
             "models/nsfw_marqo.pte", 384, IMAGENET_MEAN, IMAGENET_STD,
             positiveIndices = intArrayOf(0),

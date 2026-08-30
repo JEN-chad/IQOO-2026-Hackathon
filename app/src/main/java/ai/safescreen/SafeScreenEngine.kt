@@ -24,7 +24,7 @@ import kotlinx.coroutines.withContext
  */
 class SafeScreenEngine private constructor(
     private val detectors: DetectorFactory.Detectors,
-    private val policy: PolicyEngine,
+    val policy: PolicyEngine,
 ) {
     val thresholds: Thresholds get() = policy.thresholds
     val backend: String get() = detectors.backend
@@ -40,17 +40,23 @@ class SafeScreenEngine private constructor(
         val decision: Decision,
         val hud: HudState,
         val cropRegions: List<CropRegion> = emptyList(),
+        val needsValidation: Boolean = false,
+        val validationSpec: Rect? = null,
+        val fastScore: Float = 0f,
     )
 
-    // The native ExecuTorch Module is not thread-safe; confine all inference to one thread.
+    // The native ExecuTorch Module is not thread-safe; confine all inference to one thread per instance.
     private val inferenceDispatcher =
         Executors.newSingleThreadExecutor { r -> Thread(r, "safescreen-infer") }.asCoroutineDispatcher()
+        
+    private val validatorDispatcher =
+        Executors.newSingleThreadExecutor { r -> Thread(r, "safescreen-validator") }.asCoroutineDispatcher()
 
     suspend fun analyze(item: FeedItem): Analyzed = analyzeBitmap(item.bitmap, item.id)
 
     /** Classify a raw bitmap (feed image or photo scan) through the NSFW detector + skin gate. */
     suspend fun analyzeBitmap(bitmap: Bitmap, id: String): Analyzed = withContext(inferenceDispatcher) {
-        val ml = detectors.nsfw.classify(bitmap)
+        val ml = detectors.fastNsfw.classify(bitmap)
         val blurT = policy.thresholds.nsfwBlur
         val score = if (detectors.nsfwCalibrated && detectors.backend == "QNN/HTP") {
             val skin = skinRatio(bitmap)
@@ -60,11 +66,18 @@ class SafeScreenEngine private constructor(
                 else -> ml.score.coerceAtMost((blurT - 0.05f).coerceAtLeast(0f))
             }
         } else ml.score
-        val nsfw = NsfwResult(score, ml.latencyMs, ml.backend)
+        
+        val needsValidation = score >= 0.15f && detectors.validatorNsfw != null
+        val finalScore = if (needsValidation && detectors.validatorNsfw != null) {
+            val vRes = withContext(validatorDispatcher) { detectors.validatorNsfw.classify(bitmap) }
+            vRes.score
+        } else score
+        
+        val nsfw = NsfwResult(finalScore, ml.latencyMs, ml.backend)
         val decision = policy.decide(nsfw)
         android.util.Log.i(
             "SafeScreenEngine",
-            "id=$id nsfw=${"%.3f".format(score)} (ml=${"%.3f".format(ml.score)}) t1=${ml.latencyMs}ms " +
+            "id=$id nsfw=${"%.3f".format(finalScore)} (ml=${"%.3f".format(ml.score)}) t1=${ml.latencyMs}ms " +
                 "backend=${ml.backend} level=$currentLevel action=${decision.action}",
         )
         val fps = if (ml.latencyMs > 0) 1000f / ml.latencyMs else 0f
@@ -85,7 +98,7 @@ class SafeScreenEngine private constructor(
         Analyzed(
             decision = decision,
             hud = hud,
-            cropRegions = listOf(CropRegion(Rect(0, 0, bitmap.width, bitmap.height), score, score >= blurT)),
+            cropRegions = listOf(CropRegion(Rect(0, 0, bitmap.width, bitmap.height), finalScore, finalScore >= blurT)),
         )
     }
 
@@ -104,6 +117,8 @@ class SafeScreenEngine private constructor(
         var bestSkin = 0f
         var t1 = 0L
         val cropRegions = mutableListOf<CropRegion>()
+        var needsValidation = false
+        var validationSpec: Rect? = null
 
         for ((idx, spec) in cropSpecs.withIndex()) {
             val tInfStart = SystemClock.elapsedRealtime()
@@ -112,7 +127,7 @@ class SafeScreenEngine private constructor(
                 android.util.Log.i("SafeScreenEngine", "[FRAME $frameId] INFERENCE_START t=$tInfStart")
             }
             val cropBmp = Bitmap.createBitmap(bitmap, spec.left, spec.top, spec.width(), spec.height())
-            val ml = detectors.nsfw.classify(cropBmp)
+            val ml = detectors.fastNsfw.classify(cropBmp)
             t1 += ml.latencyMs
             val skin = skinRatio(cropBmp)
             if (cropBmp !== bitmap) cropBmp.recycle()
@@ -132,7 +147,12 @@ class SafeScreenEngine private constructor(
                 bestSkin = skin
             }
 
-            // Fast-path: if this crop already triggers protection, immediately return without wasting CPU on other crops
+            if (combined >= 0.15f && detectors.validatorNsfw != null) {
+                needsValidation = true
+                validationSpec = spec
+                break
+            }
+            
             if (combined >= blurT) {
                 break
             }
@@ -165,7 +185,14 @@ class SafeScreenEngine private constructor(
             status = status,
             isDegraded = !detectors.usingModels,
         )
-        Analyzed(decision, hud, cropRegions)
+        Analyzed(decision, hud, cropRegions, needsValidation, validationSpec, bestScore)
+    }
+
+    suspend fun validateAsync(bitmap: Bitmap, spec: Rect): NsfwResult = withContext(validatorDispatcher) {
+        val crop = Bitmap.createBitmap(bitmap, spec.left, spec.top, spec.width(), spec.height())
+        val result = detectors.validatorNsfw!!.classify(crop)
+        if (crop !== bitmap) crop.recycle()
+        result
     }
 
     /** Compute coordinate bounds of square crops covering the input frame (Center first). */
